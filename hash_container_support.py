@@ -52,17 +52,34 @@ def register_container_synthetic(category, clazz):
 	category.AddTypeSummary(name_spec, summary)
 
 def __lldb_init_module(debugger, dict):
-	libcxx = register_category(debugger, "lldb-toybox.libcxx-overrides")
+	libcxx_overrides = register_category(debugger, "lldb-toybox.libcxx-overrides")
+
+	# LLDB already includes support for these, make them easy to disable just to be safe
+	register_container_synthetic(libcxx_overrides, LibCXXHashContainerSyntheticProvider)
+
+	libcxx = register_category(debugger, "lldb-toybox.libcxx")
 	abseil = register_category(debugger, "lldb-toybox.abseil")
 
-	register_container_synthetic(libcxx, LibCXXHashContainerSyntheticProvider)
+	register_container_synthetic(libcxx, LibCXXHashContainerNodeSyntheticProvider)
+
 	register_container_synthetic(abseil, AbseilHashContainerSyntheticProvider)
+	register_container_synthetic(abseil, AbseilHashContainerIteratorSyntheticProvider)
+	register_container_synthetic(abseil, AbseilHashContainerConstIteratorSyntheticProvider)
+	register_container_synthetic(abseil, AbseilHashContainerNodeSyntheticProvider)
 
 def make_array_from_pointer(valobj, size, raw_pointer_type=None):
 	raw_pointer_type = raw_pointer_type or valobj.GetType()
 	array_pointer_t = raw_pointer_type.GetPointeeType().GetArrayType(size).GetPointerType()
 
 	return valobj.Cast(array_pointer_t).Dereference()
+
+def remove_typedef(valobj, levels=1):
+	target_type = valobj.GetType()
+
+	for _ in range(0, levels):
+		target_type = target_type.GetTypedefedType()
+
+	return valobj.Cast(target_type)
 
 def rename_valobj(valobj, name):
 	return valobj.CreateValueFromAddress(name, valobj.GetLoadAddress(), valobj.GetType())
@@ -170,7 +187,7 @@ class LibCXXHashContainerSyntheticProvider:
 				else:
 					# By default `value` is of std::__hash_node<K, void*>::__node_type, which is
 					#  a little too verbose, reduce to K
-					yield value.Cast(value.GetType().GetTypedefedType())
+					yield remove_typedef(value)
 
 		self.child_list = build_ordered_child_list(generator, self.is_map)
 
@@ -190,6 +207,67 @@ class LibCXXHashContainerSyntheticProvider:
 
 	def get_summary(self):
 		return f"size={self.size}"
+
+class LibCXXHashContainerNodeSyntheticProvider:
+	typename_regex = "^std::[^:]+::unordered_(set|map)<.+> >::node_type$"
+
+	def __init__(self, valobj, dict):
+		self.valobj = valobj
+
+		# Determine node pointer type stored by this handle
+		self.node_ptr_t = self.valobj.GetType().GetTemplateArgumentType(0).GetPointerType()
+
+		# This provider serves both unordered_set/map, as they are both backed by the same
+		#  hash table implementation, determine which variant we are
+		typename = self.valobj.GetType().GetCanonicalType().GetName()
+		match = re.search("::__(set|map)_node_handle_specifics>$", typename)
+
+		self.is_map = match.group(1) == 'map'
+
+		self.update()
+
+	def update(self):
+		node_ptr = self.valobj.GetChildMemberWithName('__ptr_')
+
+		self.is_empty = node_ptr.GetValueAsUnsigned() == 0
+		self.stored = None
+
+		if self.is_empty:
+			return
+
+		node = node_ptr.Cast(self.node_ptr_t).Dereference()
+		stored = None
+
+		if self.is_map:
+			stored = remove_typedef(node.GetChildMemberWithName('__value_').GetChildMemberWithName('__cc_'))
+		else:
+			stored = remove_typedef(node.GetChildMemberWithName('__value_'))
+
+		self.stored = rename_valobj(stored, 'stored')
+
+	def has_children(self):
+		return not self.is_empty
+
+	def num_children(self):
+		if not self.stored:
+			return 0
+
+		return 1
+
+	def get_child_at_index(self, index):
+		if not self.stored:
+			return
+
+		if not index == 0:
+			return
+
+		return self.stored
+
+	def get_child_index(self, name):
+		return None
+
+	def get_summary(self):
+		return self.is_empty and "<Empty node>" or ""
 
 class AbseilHashContainerSyntheticProvider:
 	typename_regex = "^absl::[^:]+::(flat|node)_hash_(set|map)<.+> >$"
@@ -292,3 +370,164 @@ class AbseilHashContainerSyntheticProvider:
 
 	def get_summary(self):
 		return f"size={self.size}"
+
+class AbseilHashContainerIteratorSyntheticProvider:
+	typename_regex = "^absl::[^:]+::container_internal::raw_hash_set<.+> >::iterator$"
+
+	def __init__(self, valobj, dict):
+		self.valobj = valobj
+
+		# Determining the container type is possible from the policy of the containing class
+		typename = self.valobj.GetType().GetCanonicalType().GetName()
+		match = re.search(r"::(Node|Flat)Hash(Map|Set)Policy<", typename)
+
+		self.is_flat = match.group(1) == 'Flat'
+		self.is_map = match.group(2) == 'Map'
+
+		self.update()
+
+	def update(self):
+		self.is_end = self.valobj.GetChildMemberWithName('ctrl_').GetValueAsUnsigned() == 0
+		self.pointee = None
+
+		if self.is_end:
+			return
+
+		slot = self.valobj.GetChildMemberWithName('slot_').Dereference()
+		pointee = None
+
+		if self.is_flat:
+			if self.is_map:
+				pointee = remove_typedef(slot.GetChildMemberWithName('value'), 1)
+			else:
+				pointee = remove_typedef(slot, 3)
+		else:
+			pointee = slot.Dereference()
+
+		self.pointee = rename_valobj(pointee, 'pointee')
+
+	def has_children(self):
+		return not self.is_end
+
+	def num_children(self):
+		if not self.pointee:
+			return 0
+
+		return 1
+
+	def get_child_at_index(self, index):
+		if not self.pointee:
+			return
+
+		if index != 0:
+			return
+
+		return self.pointee
+
+	def get_child_index(self, name):
+		return None
+
+	def get_summary(self):
+		return self.is_end and "<End iterator>" or ""
+
+class AbseilHashContainerConstIteratorSyntheticProvider:
+	typename_regex = "^absl::[^:]+::container_internal::raw_hash_set<.+> >::const_iterator$"
+
+	def __init__(self, valobj, dict):
+		self.valobj = valobj
+		self.update()
+
+	def update(self):
+		self.inner = self.valobj.GetChildMemberWithName('inner_')
+		self.inner.SetPreferSyntheticValue(True)
+
+	def has_children(self):
+		return self.inner.MightHaveChildren()
+
+	def num_children(self):
+		return self.inner.GetNumChildren()
+
+	def get_child_at_index(self, index):
+		return self.inner.GetChildAtIndex(index)
+
+	def get_child_index(self, name):
+		return None
+
+	def get_summary(self):
+		return self.inner.GetSummary() or ''
+
+class AbseilHashContainerNodeSyntheticProvider:
+	typename_regex = "^absl::[^:]+::container_internal::raw_hash_set<.+> >::node_type$"
+
+	def __init__(self, valobj, dict):
+		self.valobj = valobj
+
+		# The same investigative work is required to obtain the policy's `slot_type`
+		self.slot_ptr_t = None
+
+		node_handle_base = self.valobj.GetType().GetDirectBaseClassAtIndex(0).GetType()
+
+		for index in range(0, node_handle_base.GetNumberOfMemberFunctions()):
+			func = node_handle_base.GetMemberFunctionAtIndex(index)
+
+			if func.GetName() == "slot":
+				self.slot_ptr_t = func.GetReturnType()
+				break
+
+		# Determining the container type is possible from the policy of the containing class
+		typename = node_handle_base.GetCanonicalType().GetName()
+		match = re.search(r"::(Node|Flat)Hash(Map|Set)Policy<", typename)
+
+		self.is_flat = match.group(1) == 'Flat'
+		self.is_map = match.group(2) == 'Map'
+
+		self.update()
+
+	def update(self):
+		allocator = self.valobj.GetChildMemberWithName('alloc_')
+		allocator.SetPreferSyntheticValue(True)
+
+		assert(allocator.IsSynthetic())
+
+		self.is_empty = allocator.GetNumChildren() == 0
+		self.stored = None
+
+		if self.is_empty:
+			return
+
+		slot = self.valobj.GetChildMemberWithName('slot_space_').AddressOf().Cast(self.slot_ptr_t).Dereference()
+		stored = None
+
+		if self.is_flat:
+			if self.is_map:
+				stored = remove_typedef(slot.GetChildMemberWithName('value'), 1)
+			else:
+				stored = remove_typedef(slot, 3)
+		else:
+			stored = slot.Dereference()
+
+		self.stored = rename_valobj(stored, 'stored')
+
+	def has_children(self):
+		return not self.is_empty
+
+	def num_children(self):
+		if not self.stored:
+			return 0
+
+		return 1
+
+	def get_child_at_index(self, index):
+		if not self.stored:
+			return
+
+		if not index == 0:
+			return
+
+		return self.stored
+
+	def get_child_index(self, name):
+		return None
+
+	def get_summary(self):
+		return self.is_empty and "<Empty node>" or ""

@@ -1,16 +1,14 @@
-# lldb-toybox
-Various LLDB extensions that make debugging C++ code a bit more seamless
+# lldb-toybox 🧰
+Various LLDB extensions that make debugging C++ code a bit more seamless:
 
-## Ordered hash table containers
-Implemented by `hash_container_support.py`
+## Features
 
+### Naturally ordered hash table contents
 The native [LLDB data formatters](https://lldb.llvm.org/use/variable.html) enumerate hash table based containers in iteration order. This can
 be inconvenient for large registries where a simple integral key is mapped to a more complex type: finding the appropriate entry is difficult,
 as the elements are listed in _iteration order_ by default.
 
-`lldb-toybox` provides an custom [synthetic children provider](https://lldb.llvm.org/use/variable.html#synthetic-children) for supported container
-types where the key can be converted into a simple integral value (IE by extracting the only field from the value), and prints elements in their
-_natural order_ instead:
+Type formatter implementations in `lldb-toybox` print elements in their _natural order_ if the key of an entry is convertible to an integral type:
 
 <table>
 <tr>
@@ -75,12 +73,44 @@ _natural order_ instead:
 </tr>
 </table>
 
-In addition to providing an override for libc++ types, the script also supports [Abseil's hash table](https://abseil.io/docs/cpp/guides/container#hash-tables)
-based containers.
+### Extended `node_type` support
+Native LLDB formatters lack support for various `node_type`s for containers. `lldb-toybox` adds it's own implementation:
+```
+(std::unordered_map<int, int>::node_type) <Empty node>
+
+(std::unordered_map<int, int>::node_type) {
+  stored = (first = 100, second = 1000)
+}
+```
+
+### Extended `iterator` support
+Native LLDB formatters iterator support is extended to provide better summaries.
+```
+(absl::container_internal::raw_hash_set<...>::iterator) <End iterator>
+
+(absl::container_internal::raw_hash_set<...>::iterator) {
+  pointee = (first = 200, second = 2000)
+}
+```
+
+## Supported types
+
+### libc++ [`std::unordered_(set|map)`](https://en.cppreference.com/w/cpp/container)
+Implemented by `hash_container_support.py`, enabled by the `lldb-toybox.libcxx` and `lldb-toybox.libcxx-overrides` type categories.
+
+* Support for naturally ordered elements (overrides [native implementation](https://github.com/apple/llvm-project/blob/next/lldb/source/Plugins/Language/CPlusPlus/LibCxxUnorderedMap.cpp)!)
+* Support for `node_type`
 
 > [!WARNING]
-> Replacing the [native data formatter implementation](https://github.com/apple/llvm-project/blob/next/lldb/source/Plugins/Language/CPlusPlus/LibCxxUnorderedMap.cpp)
-> of LLDB for libc++ types with a Python script comes with a performance impact, and has a risk of breaking for future libc++ versions.
+> Replacing the native data formatter implementation of LLDB for libc++ types with a Python script comes with a slight
+> performance impact, and has a risk of breaking for future libc++ versions.
 >
 > If you are experiencing issues you can disable the override through the `lldb-toybox.libcxx-overrides` type category:  
 > `type category disable lldb-toybox.libcxx-overrides`
+
+### Abseil [`absl::(node|flat)_hash_(set|map)`](https://abseil.io/docs/cpp/guides/container#hash-tables)
+Implemented by `hash_container_support.py`, enabled by the `lldb-toybox.abseil` type category.
+
+* Support for naturally ordered elements
+* Support for `iterator` and `const_iterator`
+* Support for `node_type`
