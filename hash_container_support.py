@@ -100,6 +100,37 @@ def try_extract_natural_index(valobj):
 
 	return None
 
+SIZE_PROBING_LARGE_SIZE = 100
+SIZE_PROBING_VALID_ENTRIES_REQUIRED = 10
+
+def probe_size(generator, claimed_size):
+	# Sometimes we are asked to provide a summary for a container which is not
+	#  actually initialized. In this situation the read size is garbage.
+	#
+	# For non-trivial sizes we probe the container's generator function to see
+	#  whether the first few elements are valid, ruling out corrupt/uninitialized
+	#  containers before Xcode tries to enumerate millions of elements
+
+	if claimed_size < SIZE_PROBING_LARGE_SIZE:
+		return claimed_size
+
+	count = 0
+
+	for valobj in generator():
+		if valobj.GetError().Fail():
+			return 0
+
+		count += 1
+
+		if count >= SIZE_PROBING_VALID_ENTRIES_REQUIRED:
+			break
+
+	# Check if generator stopped early
+	if count < SIZE_PROBING_VALID_ENTRIES_REQUIRED:
+		return 0
+
+	return claimed_size
+
 def build_ordered_child_list(generator, is_map):
 	child_list = list()
 	child_map = dict()
@@ -153,24 +184,16 @@ class LibCXXHashContainerSyntheticProvider:
 		self.update()
 
 	def update(self):
+		hash_table = self.valobj.GetChildMemberWithName("__table_");
+
 		# https://github.com/apple/llvm-project/blob/next/libcxx/include/__hash_table
 		#   __compressed_pair<__first_node, __node_allocator>     __p1_;
 		#   __compressed_pair<size_type, hasher>                  __p2_;
-		size_and_hasher = self.valobj.GetChildMemberWithName("__table_").GetChildMemberWithName("__p2_")
+		first_node_and_allocator = hash_table.GetChildMemberWithName("__p1_")
+		size_and_hasher = hash_table.GetChildMemberWithName("__p2_")
 
-		# Eagerly grab size to provide summaries
-		self.size = size_and_hasher.GetChildAtIndex(0).GetChildMemberWithName("__value_").GetValueAsUnsigned(0)
-
-		# Container elements are discovered lazily
-		self.child_list = None
-
-	def populate(self):
-		if self.child_list:
-			return
-
-		hash_table = self.valobj.GetChildMemberWithName("__table_")
-
-		first_node = hash_table.GetChildMemberWithName("__p1_").GetChildAtIndex(0).GetChildMemberWithName("__value_")
+		# Create generator function that can provide list of elements in this container
+		first_node = first_node_and_allocator.GetChildAtIndex(0).GetChildMemberWithName("__value_")
 		node_type = first_node.GetType().GetTemplateArgumentType(0).GetPointeeType()
 
 		def generator():
@@ -189,7 +212,20 @@ class LibCXXHashContainerSyntheticProvider:
 					#  a little too verbose, reduce to K
 					yield remove_typedef(value)
 
-		self.child_list = build_ordered_child_list(generator, self.is_map)
+		self.generator = generator
+
+		# Eagerly grab and probe for probable size - mostly for the sake of summaries
+		self.size = size_and_hasher.GetChildAtIndex(0).GetChildMemberWithName("__value_").GetValueAsUnsigned(0)
+		self.size = probe_size(self.generator, self.size)
+
+		# Container elements are generated lazily
+		self.child_list = None
+
+	def populate(self):
+		if self.child_list:
+			return
+
+		self.child_list = build_ordered_child_list(self.generator, self.is_map)
 
 	def has_children(self):
 		return True # This formatter _may have_ children
@@ -317,26 +353,24 @@ class AbseilHashContainerSyntheticProvider:
 
 	def update(self):
 		# Grab common member variables from compressed tuple
-		self.common = self.valobj.GetChildMemberWithName('settings_').GetChildAtIndex(0).GetChildAtIndex(0).GetChildMemberWithName('value')
-
-		# Grab size of map, note that 'size_' contains an unrelated flag on the least significant bit
-		self.size = self.common.GetChildMemberWithName('size_').GetValueAsUnsigned() >> 1
-
-		# Grab capacity of map, this will help with accessing the ctrl/slot arrays
-		self.capacity = self.common.GetChildMemberWithName('capacity_').GetValueAsUnsigned()
-
-		# Container elements are discovered lazily
-		self.child_list = None
-
-	def populate(self):
-		if self.child_list:
-			return
-
-		ctrl_arr = make_array_from_pointer(self.common.GetChildMemberWithName('control_'), self.capacity)
-		slot_arr = make_array_from_pointer(self.common.GetChildMemberWithName('slots_'), self.capacity, self.slot_ptr_t)
+		common = self.valobj.GetChildMemberWithName('settings_').GetChildAtIndex(0).GetChildAtIndex(0).GetChildMemberWithName('value')
 
 		def generator():
-			for index in range(0, self.capacity):
+			capacity = common.GetChildMemberWithName('capacity_').GetValueAsUnsigned()
+
+			# Try to weed out uninitialized containers by checking whether capacity is valid as per:
+			# ```
+			# inline bool IsValidCapacity(size_t n) {
+			#     return ((n + 1) & n) == 0 && n > 0;
+			# }
+			# ```
+			if (capacity + 1) & capacity != 0:
+				return
+
+			ctrl_arr = make_array_from_pointer(common.GetChildMemberWithName('control_'), capacity)
+			slot_arr = make_array_from_pointer(common.GetChildMemberWithName('slots_'), capacity, self.slot_ptr_t)
+
+			for index in range(0, capacity):
 				ctrl = ctrl_arr.GetChildAtIndex(index).GetValueAsUnsigned()
 
 				if ctrl & 0x80:
@@ -352,7 +386,20 @@ class AbseilHashContainerSyntheticProvider:
 				else:
 					yield slot.Dereference()
 
-		self.child_list = build_ordered_child_list(generator, self.is_map)
+		self.generator = generator
+
+		# Grab size of map, note that 'size_' contains an unrelated flag on the least significant bit
+		self.size = common.GetChildMemberWithName('size_').GetValueAsUnsigned() >> 1
+		self.size = probe_size(self.generator, self.size)
+
+		# Container elements are discovered lazily
+		self.child_list = None
+
+	def populate(self):
+		if self.child_list:
+			return
+
+		self.child_list = build_ordered_child_list(self.generator, self.is_map)
 
 	def has_children(self):
 		return True # This formatter _may have_ children
