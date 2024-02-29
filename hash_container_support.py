@@ -55,15 +55,19 @@ def __lldb_init_module(debugger, dict):
 	libcxx_overrides = register_category(debugger, "lldb-toybox.libcxx-overrides")
 
 	# LLDB already includes support for these, make them easy to disable just to be safe
-	register_container_synthetic(libcxx_overrides, LibCXXHashContainerSyntheticProvider)
+	register_container_synthetic(libcxx_overrides, LibCXXUnorderedMapSynthetic)
+	register_container_synthetic(libcxx_overrides, LibCXXUnorderedSetSynthetic)
 
 	libcxx = register_category(debugger, "lldb-toybox.libcxx")
 	abseil = register_category(debugger, "lldb-toybox.abseil")
 
 	register_container_synthetic(libcxx, LibCXXHashContainerNodeSyntheticProvider)
 
-	register_container_synthetic(abseil, AbseilHashContainerSyntheticProvider)
-	register_container_synthetic(abseil, AbseilHashContainerIteratorSyntheticProvider)
+	register_container_synthetic(abseil, AbseilFlatHashMapSynthetic)
+	register_container_synthetic(abseil, AbseilFlatHashSetSynthetic)
+	register_container_synthetic(abseil, AbseilNodeHashMapSynthetic)
+	register_container_synthetic(abseil, AbseilNodeHashSetSynthetic)
+
 	register_container_synthetic(abseil, AbseilHashContainerConstIteratorSyntheticProvider)
 	register_container_synthetic(abseil, AbseilHashContainerNodeSyntheticProvider)
 
@@ -100,36 +104,18 @@ def try_extract_natural_index(valobj):
 
 	return None
 
-SIZE_PROBING_LARGE_SIZE = 100
-SIZE_PROBING_VALID_ENTRIES_REQUIRED = 10
+def is_pow2(number):
+	return (number + 1) & number == 0
 
-def probe_size(generator, claimed_size):
-	# Sometimes we are asked to provide a summary for a container which is not
-	#  actually initialized. In this situation the read size is garbage.
-	#
-	# For non-trivial sizes we probe the container's generator function to see
-	#  whether the first few elements are valid, ruling out corrupt/uninitialized
-	#  containers before Xcode tries to enumerate millions of elements
+def is_prime(number):
+	if number <= 1:
+		return False
 
-	if claimed_size < SIZE_PROBING_LARGE_SIZE:
-		return claimed_size
+	for divisor in range(2, int(number**0.5)+1):
+		if number % divisor == 0:
+			return False
 
-	count = 0
-
-	for valobj in generator():
-		if valobj.GetError().Fail():
-			return 0
-
-		count += 1
-
-		if count >= SIZE_PROBING_VALID_ENTRIES_REQUIRED:
-			break
-
-	# Check if generator stopped early
-	if count < SIZE_PROBING_VALID_ENTRIES_REQUIRED:
-		return 0
-
-	return claimed_size
+	return True
 
 def build_ordered_child_list(generator, is_map):
 	child_list = list()
@@ -168,81 +154,266 @@ def build_ordered_child_list(generator, is_map):
 
 	return child_list
 
-class LibCXXHashContainerSyntheticProvider:
-	typename_regex = "^std::[^:]+::unordered_(set|map)<.+> >$"
+class IterableContainer:
+	"""Interface class describing required functionality for use with IterableContainerSyntheric"""
 
-	def __init__(self, valobj, dict):
-		self.valobj = valobj
+	def update(self):
+		return
 
-		# This provider serves both unordered_set/map, as they are both backed by the same
-		#  hash table implementation, determine which variant we are
-		typename = self.valobj.GetType().GetCanonicalType().GetName()
-		match = re.search(r"^std::[^:]+::unordered_(map|set)", typename)
+	def validate(self):
+		return
 
-		self.is_map = match.group(1) == 'map'
+	def get_size(self):
+		return 0
+
+	def get_summary(self):
+		return f"size={self.get_size()}"
+
+	def iterator(self):
+		return None
+
+class IterableContainerSynthetic:
+	"""Implementation of the LLDB SyntheticChildrenProvider for IterableContainers"""
+
+	def __init__(self, container, rename_children=True):
+		self.container = container
+		self.rename_children = rename_children
 
 		self.update()
 
 	def update(self):
-		hash_table = self.valobj.GetChildMemberWithName("__table_");
+		self.error = None
+		self.size = None
+		self.iterator = None
+		self.cached_children = None
 
-		# https://github.com/apple/llvm-project/blob/next/libcxx/include/__hash_table
-		#   __compressed_pair<__first_node, __node_allocator>     __p1_;
-		#   __compressed_pair<size_type, hasher>                  __p2_;
-		first_node_and_allocator = hash_table.GetChildMemberWithName("__p1_")
-		size_and_hasher = hash_table.GetChildMemberWithName("__p2_")
+		# Let underlying container update if it is stateful
+		self.container.update()
 
-		# Create generator function that can provide list of elements in this container
-		first_node = first_node_and_allocator.GetChildAtIndex(0).GetChildMemberWithName("__value_")
-		node_type = first_node.GetType().GetTemplateArgumentType(0).GetPointeeType()
-
-		def generator():
-			next = first_node.GetChildMemberWithName("__next_")
-
-			while next.GetValueAsUnsigned(0):
-				node = next.Dereference().Cast(node_type)
-
-				next = node.GetChildMemberWithName("__next_")
-				value = node.GetChildMemberWithName("__value_")
-
-				if self.is_map:
-					yield value.GetChildMemberWithName("__cc_")
-				else:
-					# By default `value` is of std::__hash_node<K, void*>::__node_type, which is
-					#  a little too verbose, reduce to K
-					yield remove_typedef(value)
-
-		self.generator = generator
-
-		# Eagerly grab and probe for probable size - mostly for the sake of summaries
-		self.size = size_and_hasher.GetChildAtIndex(0).GetChildMemberWithName("__value_").GetValueAsUnsigned(0)
-		self.size = probe_size(self.generator, self.size)
-
-		# Container elements are generated lazily
-		self.child_list = None
-
-	def populate(self):
-		if self.child_list:
-			return
-
-		self.child_list = build_ordered_child_list(self.generator, self.is_map)
+		# Offer ability to opt-out of calling the iterator if the container appears invalid
+		self.error = self.container.validate()
 
 	def has_children(self):
-		return True # This formatter _may have_ children
+		return self.error is None
 
 	def num_children(self):
+		if self.error:
+			return 0
+
+		if not self.size:
+			self.size = self.container.get_size()
+
 		return self.size
 
 	def get_child_at_index(self, index):
-		self.populate()
+		if self.error:
+			return None
 
-		return self.child_list[index]
+		if index < 0:
+			return None
+
+		cached = 0
+
+		if self.cached_children is not None:
+			cached = len(self.cached_children)
+		else:
+			self.cached_children = list()
+			self.iterator = self.container.iterator()
+
+		if cached <= index and self.iterator is not None:
+			try:
+				child = next(self.iterator)
+
+				if self.rename_children:
+					child = rename_valobj(child, f"[{cached}]")
+
+				self.cached_children.append(child)
+				cached += 1
+			except StopIteration:
+				self.iterator = None
+
+		if cached < index:
+			return None
+
+		return self.cached_children[index]
 
 	def get_child_index(self, name):
 		return None
 
 	def get_summary(self):
-		return f"size={self.size}"
+		if self.error:
+			return f"<Error: {self.error}>"
+
+		return self.container.get_summary()
+
+
+class LibCXXHashContainer(IterableContainer):
+	def __init__(self, valobj, is_map):
+		self.valobj = valobj
+		self.is_map = is_map
+
+	def update(self):
+		# https://github.com/apple/llvm-project/blob/next/libcxx/include/__hash_table
+		#   __compressed_pair<__first_node, __node_allocator>     __p1_;
+		#   __compressed_pair<size_type, hasher>                  __p2_;
+		self.table = self.valobj.GetChildMemberWithName("__table_");
+
+	def get_bucket_count(self):
+		return self.table.GetChildMemberWithName('__bucket_list_') \
+			.GetChildMemberWithName('__ptr_')                      \
+			.GetChildAtIndex(1)                                    \
+			.GetChildMemberWithName('__value_')                    \
+			.GetChildMemberWithName('__data_')                     \
+			.GetChildAtIndex(0)                                    \
+			.GetChildMemberWithName('__value_')                    \
+			.GetValueAsUnsigned()
+
+	def validate(self):
+		bucket_count = self.get_bucket_count()
+
+		if bucket_count != 0 and not is_pow2(bucket_count) and not is_prime(bucket_count):
+			return f"Bucket count {bucket_count} is neither pow2 nor prime"
+
+	def get_size(self):
+		return self.table.GetChildMemberWithName("__p2_").GetChildAtIndex(0).GetChildMemberWithName("__value_").GetValueAsUnsigned()
+
+	def iterator(self):
+		first_node = self.table.GetChildMemberWithName("__p1_").GetChildAtIndex(0).GetChildMemberWithName("__value_")
+		node_type = first_node.GetType().GetTemplateArgumentType(0).GetPointeeType()
+
+		next = first_node.GetChildMemberWithName("__next_")
+
+		while next.GetValueAsUnsigned(0):
+			node = next.Dereference().Cast(node_type)
+
+			next = node.GetChildMemberWithName("__next_")
+			value = node.GetChildMemberWithName("__value_")
+
+			if self.is_map:
+				yield value.GetChildMemberWithName("__cc_")
+			else:
+				# By default `value` is of std::__hash_node<K, void*>::__node_type, which is
+				#  a little too verbose, reduce to K
+				yield remove_typedef(value)
+
+class LibCXXUnorderedMapSynthetic(IterableContainerSynthetic):
+	typename_regex = "^std::[^:]+::unordered_map<.+> >$"
+
+	def __init__(self, valobj, dict):
+		super().__init__(LibCXXHashContainer(valobj, True))
+
+class LibCXXUnorderedSetSynthetic(IterableContainerSynthetic):
+	typename_regex = "^std::[^:]+::unordered_set<.+> >$"
+
+	def __init__(self, valobj, dict):
+		super().__init__(LibCXXHashContainer(valobj, False))
+
+
+class AbseilHashContainer(IterableContainer):
+	def __init__(self, valobj, is_map, is_flat):
+		self.valobj = valobj
+		self.is_map = is_map
+		self.is_flat = is_flat
+
+		# The underlying hashtable stores elements in "slots", whose type is difficult to obtain.. at the time of
+		#  writing, SB API does not let us get the typedefs in the policy template argument that would make this
+		#  much simpler/robust. (https://discourse.llvm.org/t/traversing-member-types-of-a-type/72452/12)
+		self.slot_ptr_t = None
+
+		# Drilldown to the root class, which will be raw_hash_set<>
+		root = self.valobj.GetType()
+
+		while root.GetNumberOfDirectBaseClasses() != 0:
+			root = root.GetDirectBaseClassAtIndex(0).GetType()
+
+		# Obtain `raw_hash_set<>::iterator` from `raw_hash_set<>::begin()`
+		iterator = None
+
+		for index in range(0, root.GetNumberOfMemberFunctions()):
+			func = root.GetMemberFunctionAtIndex(index)
+
+			if func.GetName() == 'begin':
+				iterator = func.GetReturnType()
+				break
+
+		# Obtain `raw_hash_set<>::slot*` from `raw_hash_set<>::iterator::slot()`
+		for index in range(0, iterator.GetNumberOfMemberFunctions()):
+			func = iterator.GetMemberFunctionAtIndex(index)
+
+			if func.GetName() == "slot":
+				self.slot_ptr_t = func.GetReturnType()
+				break
+
+		# Grab common member variables from compressed tuple
+		self.common = self.valobj.GetChildMemberWithName('settings_').GetChildAtIndex(0).GetChildAtIndex(0).GetChildMemberWithName('value')
+
+	def update(self):
+		pass
+
+	def get_capacity(self):
+		return self.common.GetChildMemberWithName('capacity_').GetValueAsUnsigned()
+
+	def validate(self):
+		capacity = self.get_capacity()
+
+		if not is_prime(capacity):
+			return f"Capacity {capacity} is nto pow2"
+
+		size = self.get_size()
+
+		if capacity < size:
+			return f"Size {size} exceeds capacity {capacity}"
+
+	def get_size(self):
+		return self.common.GetChildMemberWithName('size_').GetValueAsUnsigned() >> 1
+
+	def iterator(self):
+		capacity = self.get_capacity()
+
+		ctrl_arr = make_array_from_pointer(self.common.GetChildMemberWithName('control_'), capacity)
+		slot_arr = make_array_from_pointer(self.common.GetChildMemberWithName('slots_'), capacity, self.slot_ptr_t)
+
+		for index in range(0, capacity):
+			ctrl = ctrl_arr.GetChildAtIndex(index).GetValueAsUnsigned()
+
+			if ctrl & 0x80:
+				continue
+
+			slot = slot_arr.GetChildAtIndex(index)
+
+			if self.is_flat:
+				if self.is_map:
+					yield slot.GetChildMemberWithName('value')
+				else:
+					yield slot
+			else:
+				yield slot.Dereference()
+
+
+class AbseilFlatHashMapSynthetic(IterableContainerSynthetic):
+	typename_regex = "^absl::[^:]+::flat_hash_map<.+> >$"
+
+	def __init__(self, valobj, dict):
+		super().__init__(AbseilHashContainer(valobj, True, True))
+
+class AbseilFlatHashSetSynthetic(IterableContainerSynthetic):
+	typename_regex = "^absl::[^:]+::flat_hash_set<.+> >$"
+
+	def __init__(self, valobj, dict):
+		super().__init__(AbseilHashContainer(valobj, False, True))
+
+class AbseilNodeHashMapSynthetic(IterableContainerSynthetic):
+	typename_regex = "^absl::[^:]+::node_hash_map<.+> >$"
+
+	def __init__(self, valobj, dict):
+		super().__init__(AbseilHashContainer(valobj, True, False))
+
+class AbseilNodeHashSetSynthetic(IterableContainerSynthetic):
+	typename_regex = "^absl::[^:]+::node_hash_set<.+> >$"
+
+	def __init__(self, valobj, dict):
+		super().__init__(AbseilHashContainer(valobj, False, False))
+
 
 class LibCXXHashContainerNodeSyntheticProvider:
 	typename_regex = "^std::[^:]+::unordered_(set|map)<.+> >::node_type$"
@@ -304,119 +475,6 @@ class LibCXXHashContainerNodeSyntheticProvider:
 
 	def get_summary(self):
 		return self.is_empty and "<Empty node>" or ""
-
-class AbseilHashContainerSyntheticProvider:
-	typename_regex = "^absl::[^:]+::(flat|node)_hash_(set|map)<.+> >$"
-
-	def __init__(self, valobj, dict):
-		self.valobj = valobj
-
-		# Many flat_hash_... types are implemented with inheritance from raw_hash_set, and
-		#  only differ in policy template parameters. As such much of the code can be shared
-		#  between them. Determine which type we represent
-		typename = self.valobj.GetType().GetCanonicalType().GetName()
-		match = re.search(r"absl::[^:]+::(flat|node)_hash_(map|set)", typename)
-
-		self.is_flat = match.group(1) == 'flat'
-		self.is_map = match.group(2) == 'map'
-
-		# The underlying hashtable stores elements in "slots", whose type is difficult to obtain.. at the time of
-		#  writing, SB API does not let us get the typedefs in the policy template argument that would make this
-		#  much simpler/robust. (https://discourse.llvm.org/t/traversing-member-types-of-a-type/72452/12)
-		self.slot_ptr_t = None
-
-		# Drilldown to the root class, which will be raw_hash_set<>
-		root = self.valobj.GetType()
-
-		while root.GetNumberOfDirectBaseClasses() != 0:
-			root = root.GetDirectBaseClassAtIndex(0).GetType()
-
-		# Obtain `raw_hash_set<>::iterator` from `raw_hash_set<>::begin()`
-		iterator = None
-
-		for index in range(0, root.GetNumberOfMemberFunctions()):
-			func = root.GetMemberFunctionAtIndex(index)
-
-			if func.GetName() == 'begin':
-				iterator = func.GetReturnType()
-				break
-
-		# Obtain `raw_hash_set<>::slot*` from `raw_hash_set<>::iterator::slot()`
-		for index in range(0, iterator.GetNumberOfMemberFunctions()):
-			func = iterator.GetMemberFunctionAtIndex(index)
-
-			if func.GetName() == "slot":
-				self.slot_ptr_t = func.GetReturnType()
-				break
-
-		self.update()
-
-	def update(self):
-		# Grab common member variables from compressed tuple
-		common = self.valobj.GetChildMemberWithName('settings_').GetChildAtIndex(0).GetChildAtIndex(0).GetChildMemberWithName('value')
-
-		def generator():
-			capacity = common.GetChildMemberWithName('capacity_').GetValueAsUnsigned()
-
-			# Try to weed out uninitialized containers by checking whether capacity is valid as per:
-			# ```
-			# inline bool IsValidCapacity(size_t n) {
-			#     return ((n + 1) & n) == 0 && n > 0;
-			# }
-			# ```
-			if (capacity + 1) & capacity != 0:
-				return
-
-			ctrl_arr = make_array_from_pointer(common.GetChildMemberWithName('control_'), capacity)
-			slot_arr = make_array_from_pointer(common.GetChildMemberWithName('slots_'), capacity, self.slot_ptr_t)
-
-			for index in range(0, capacity):
-				ctrl = ctrl_arr.GetChildAtIndex(index).GetValueAsUnsigned()
-
-				if ctrl & 0x80:
-					continue
-
-				slot = slot_arr.GetChildAtIndex(index)
-
-				if self.is_flat:
-					if self.is_map:
-						yield slot.GetChildMemberWithName('value')
-					else:
-						yield slot
-				else:
-					yield slot.Dereference()
-
-		self.generator = generator
-
-		# Grab size of map, note that 'size_' contains an unrelated flag on the least significant bit
-		self.size = common.GetChildMemberWithName('size_').GetValueAsUnsigned() >> 1
-		self.size = probe_size(self.generator, self.size)
-
-		# Container elements are discovered lazily
-		self.child_list = None
-
-	def populate(self):
-		if self.child_list:
-			return
-
-		self.child_list = build_ordered_child_list(self.generator, self.is_map)
-
-	def has_children(self):
-		return True # This formatter _may have_ children
-
-	def num_children(self):
-		return self.size
-
-	def get_child_at_index(self, index):
-		self.populate()
-
-		return self.child_list[index]
-
-	def get_child_index(self, name):
-		return None
-
-	def get_summary(self):
-		return f"size={self.size}"
 
 class AbseilHashContainerIteratorSyntheticProvider:
 	typename_regex = "^absl::[^:]+::container_internal::raw_hash_set<.+> >::iterator$"
