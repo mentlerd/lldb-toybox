@@ -117,43 +117,6 @@ def is_prime(number):
 
 	return True
 
-def build_ordered_child_list(generator, is_map):
-	child_list = list()
-	child_map = dict()
-
-	# Iterate over map hashtable via provided generator
-	for iter_index, valobj in enumerate(generator()):
-		child = valobj
-
-		# Iteration based order is often not that useful during debugging, try
-		#  to extract a more natural index to order by
-		key = is_map and valobj.GetChildMemberWithName('first') or valobj
-
-		natural_index = try_extract_natural_index(key)
-
-		if natural_index is None:
-			# Nothing better to go by, iteration index will have to suffice
-			child_list.append(rename_valobj(child, f'[{iter_index}]'))
-		else:
-			# Since we are ordering by natural_index, it makes sense to give some
-			#  additional prefix describing the typename of the ID
-			prefix = key.GetType().GetUnqualifiedType().GetName()
-
-			if is_map:
-				# If the key has no synthetic its natural_index is likely a full
-				#  representation, show only the mapped value to the user
-				if not key.IsSynthetic():
-					child = valobj.GetChildMemberWithName('second')
-
-			# Store the child by it's natural index
-			child_map[natural_index] = rename_valobj(child, f'{prefix}({natural_index})')
-
-	# Flush delayed natural index based children
-	for index, child in sorted(child_map.items()):
-		child_list.append(child)
-
-	return child_list
-
 class IterableContainer:
 	"""Interface class describing required functionality for use with IterableContainerSyntheric"""
 
@@ -246,6 +209,69 @@ class IterableContainerSynthetic:
 
 		return self.container.get_summary()
 
+class SyntheticAdapter:
+	def __init__(self, wrapped):
+		self.wrapped = wrapped
+
+	def __getattr__(self, name):
+		return getattr(self.wrapped, name)
+
+class SortingSyntheticAdapter(SyntheticAdapter):
+	def __init__(self, wrapped, is_map):
+		super().__init__(wrapped)
+
+		self.is_map = is_map
+
+	def update(self):
+		self.children = None
+
+		self.wrapped.update()
+
+	def populate(self):
+		if self.children is not None:
+			return
+
+		child_list = list()
+		child_map = dict()
+
+		# Iterate over map hashtable via provided generator
+		for iter_index in range(0, self.wrapped.num_children()):
+			child = self.wrapped.get_child_at_index(iter_index)
+
+			# Iteration based order is often not that useful during debugging, try
+			#  to extract a more natural index to order by
+			key = self.is_map and child.GetChildMemberWithName('first') or child
+
+			natural_index = try_extract_natural_index(key)
+
+			if natural_index is None:
+				# Nothing better to go by, iteration index will have to suffice
+				child_list.append(rename_valobj(child, f'[{iter_index}]'))
+			else:
+				# Since we are ordering by natural_index, it makes sense to give some
+				#  additional prefix describing the typename of the ID
+				prefix = key.GetType().GetUnqualifiedType().GetName()
+
+				if self.is_map:
+					# If the key has no synthetic its natural_index is likely a full
+					#  representation, show only the mapped value to the user
+					if not key.IsSynthetic():
+						child = child.GetChildMemberWithName('second')
+
+				# Store the child by it's natural index
+				child_map[natural_index] = rename_valobj(child, f'{prefix}({natural_index})')
+
+		# Flush delayed natural index based children
+		for index, child in sorted(child_map.items()):
+			child_list.append(child)
+
+		self.children = child_list
+
+	def get_child_at_index(self, index):
+		self.populate()
+
+		return self.children[index]
+
 
 class LibCXXHashContainer(IterableContainer):
 	def __init__(self, valobj, is_map):
@@ -296,17 +322,27 @@ class LibCXXHashContainer(IterableContainer):
 				#  a little too verbose, reduce to K
 				yield remove_typedef(value)
 
-class LibCXXUnorderedMapSynthetic(IterableContainerSynthetic):
+class LibCXXUnorderedMapSynthetic(SyntheticAdapter):
 	typename_regex = "^std::[^:]+::unordered_map<.+> >$"
 
 	def __init__(self, valobj, dict):
-		super().__init__(LibCXXHashContainer(valobj, True))
+		container = LibCXXHashContainer(valobj, True)
 
-class LibCXXUnorderedSetSynthetic(IterableContainerSynthetic):
+		synthetic = IterableContainerSynthetic(container, False)
+		synthetic = SortingSyntheticAdapter(synthetic, True)
+
+		super().__init__(synthetic)
+
+class LibCXXUnorderedSetSynthetic(SyntheticAdapter):
 	typename_regex = "^std::[^:]+::unordered_set<.+> >$"
 
 	def __init__(self, valobj, dict):
-		super().__init__(LibCXXHashContainer(valobj, False))
+		container = LibCXXHashContainer(valobj, False)
+
+		synthetic = IterableContainerSynthetic(container, False)
+		synthetic = SortingSyntheticAdapter(synthetic, False)
+
+		super().__init__(synthetic)
 
 
 class AbseilHashContainer(IterableContainer):
@@ -390,29 +426,49 @@ class AbseilHashContainer(IterableContainer):
 				yield slot.Dereference()
 
 
-class AbseilFlatHashMapSynthetic(IterableContainerSynthetic):
+class AbseilFlatHashMapSynthetic(SyntheticAdapter):
 	typename_regex = "^absl::[^:]+::flat_hash_map<.+> >$"
 
 	def __init__(self, valobj, dict):
-		super().__init__(AbseilHashContainer(valobj, True, True))
+		container = AbseilHashContainer(valobj, True, True)
 
-class AbseilFlatHashSetSynthetic(IterableContainerSynthetic):
-	typename_regex = "^absl::[^:]+::flat_hash_set<.+> >$"
+		synthetic = IterableContainerSynthetic(container, False)
+		synthetic = SortingSyntheticAdapter(synthetic, True)
 
-	def __init__(self, valobj, dict):
-		super().__init__(AbseilHashContainer(valobj, False, True))
+		super().__init__(synthetic)
 
-class AbseilNodeHashMapSynthetic(IterableContainerSynthetic):
+class AbseilNodeHashMapSynthetic(SyntheticAdapter):
 	typename_regex = "^absl::[^:]+::node_hash_map<.+> >$"
 
 	def __init__(self, valobj, dict):
-		super().__init__(AbseilHashContainer(valobj, True, False))
+		container = AbseilHashContainer(valobj, True, False)
 
-class AbseilNodeHashSetSynthetic(IterableContainerSynthetic):
+		synthetic = IterableContainerSynthetic(container, False)
+		synthetic = SortingSyntheticAdapter(synthetic, True)
+
+		super().__init__(synthetic)
+
+class AbseilFlatHashSetSynthetic(SyntheticAdapter):
+	typename_regex = "^absl::[^:]+::flat_hash_set<.+> >$"
+
+	def __init__(self, valobj, dict):
+		container = AbseilHashContainer(valobj, False, True)
+
+		synthetic = IterableContainerSynthetic(container, False)
+		synthetic = SortingSyntheticAdapter(synthetic, False)
+
+		super().__init__(synthetic)
+
+class AbseilNodeHashSetSynthetic(SyntheticAdapter):
 	typename_regex = "^absl::[^:]+::node_hash_set<.+> >$"
 
 	def __init__(self, valobj, dict):
-		super().__init__(AbseilHashContainer(valobj, False, False))
+		container = AbseilHashContainer(valobj, False, True)
+
+		synthetic = IterableContainerSynthetic(container, False)
+		synthetic = SortingSyntheticAdapter(synthetic, False)
+
+		super().__init__(synthetic)
 
 
 class LibCXXHashContainerNodeSyntheticProvider:
