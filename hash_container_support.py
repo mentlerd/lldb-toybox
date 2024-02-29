@@ -117,6 +117,50 @@ def is_prime(number):
 
 	return True
 
+class SyntheticAdapter:
+	def __init__(self, wrapped):
+		self.wrapped = wrapped
+
+	def __getattr__(self, name):
+		return getattr(self.wrapped, name)
+
+_scripted_t = None
+_scripted_stack = []
+
+class _ScriptedSynthetic(SyntheticAdapter):
+	def __init__(self, valobj, dict):
+		super().__init__(None)
+
+		self.valobj = valobj
+
+		global _scripted_t
+		global _scripted_stack
+
+		_scripted_stack.append(self)
+
+def CreateScriptedValue(valobj, name, backend):
+	global _scripted_t
+	global _scripted_stack
+
+	target = valobj.GetTarget()
+
+	if _scripted_t is None:
+		_scripted_t = valobj.EvaluateExpression('struct $lldb_toybox; ($lldb_toybox*) 0').GetType().GetPointeeType()
+
+		target.GetDebugger().GetDefaultCategory().AddTypeSynthetic(
+			lldb.SBTypeNameSpecifier(_scripted_t.GetName()),
+			lldb.SBTypeSynthetic.CreateWithClassName(f'{__name__}._ScriptedSynthetic')
+		)
+
+	valobj = target.CreateValueFromData(name, lldb.SBData.CreateDataFromInt(0), _scripted_t)
+	valobj.IsSynthetic()
+
+	synthetic = _scripted_stack.pop()
+	synthetic.wrapped = backend
+
+	return valobj
+
+
 class IterableContainer:
 	"""Interface class describing required functionality for use with IterableContainerSyntheric"""
 
@@ -208,13 +252,6 @@ class IterableContainerSynthetic:
 			return f"<Error: {self.error}>"
 
 		return self.container.get_summary()
-
-class SyntheticAdapter:
-	def __init__(self, wrapped):
-		self.wrapped = wrapped
-
-	def __getattr__(self, name):
-		return getattr(self.wrapped, name)
 
 class SortingSyntheticAdapter(SyntheticAdapter):
 	def __init__(self, wrapped, is_map):
