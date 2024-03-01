@@ -371,10 +371,10 @@ class SortingSyntheticAdapter(SyntheticAdapter):
 						child = child.GetChildMemberWithName('second')
 
 				# Store the child by it's natural index
-				child_map[natural_index] = rename_valobj(child, f'{prefix}({natural_index})')
+				child_map[(natural_index, child.GetLoadAddress())] = rename_valobj(child, f'{prefix}({natural_index})')
 
 		# Flush delayed natural index based children
-		for index, child in sorted(child_map.items()):
+		for (index, addr), child in sorted(child_map.items()):
 			child_list.append(child)
 
 		self.children = child_list
@@ -478,7 +478,7 @@ class LibCXXHashContainer(IterableContainer):
 		# This provider serves both unordered_set/map, as they are both backed by the same
 		#  hash table implementation, determine which variant we are
 		typename = self.valobj.GetType().GetCanonicalType().GetName()
-		match = re.search(r"^std::[^:]+::unordered_(map|set)", typename)
+		match = re.search(r"^std::[^:]+::unordered_(?:multi)?(map|set)", typename)
 
 		self.is_map = match.group(1) == 'map'
 
@@ -533,7 +533,7 @@ class LibCXXHashContainerIterator(Value):
 		# This provider serves both unordered_set/map, as they are both backed by the same
 		#  hash table implementation, determine which variant we are
 		typename = self.valobj.GetType().GetName()
-		match = re.search(r"^std::[^:]+::unordered_(map|set)", typename)
+		match = re.search(r"^std::[^:]+::unordered_(?:multi)?(map|set)", typename)
 
 		self.is_map = match.group(1) == 'map'
 
@@ -586,7 +586,7 @@ class LibCXXHashContainerNode(Value):
 
 
 class LibCXXHashContainerSynthetic(SyntheticAdapter):
-	typename_regex = "^std::[^:]+::unordered_(map|set)<.+> >$"
+	typename_regex = "^std::[^:]+::unordered_(multi)?(map|set)<.+> >$"
 
 	def __init__(self, valobj, dict):
 		container = LibCXXHashContainer(valobj)
@@ -597,13 +597,13 @@ class LibCXXHashContainerSynthetic(SyntheticAdapter):
 		super().__init__(synthetic)
 
 class LibCXXHashContainerIteratorSynthetic(SyntheticAdapter):
-	typename_regex = "^std::[^:]+::unordered_(set|map)<.+> >::(const_)?iterator$"
+	typename_regex = "^std::[^:]+::unordered_(multi?)(set|map)<.+> >::(const_)?iterator$"
 
 	def __init__(self, valobj, dict):
 		super().__init__(ValueSynthetic(LibCXXHashContainerIterator(valobj), rename_to='pointee'))
 
 class LibCXXHashContainerNodeSynthetic(SyntheticAdapter):
-	typename_regex = "^std::[^:]+::unordered_(set|map)<.+> >::node_type$"
+	typename_regex = "^std::[^:]+::unordered_(multi?)(set|map)<.+> >::node_type$"
 
 	def __init__(self, valobj, dict):
 		super().__init__(ValueSynthetic(LibCXXHashContainerNode(valobj), rename_to='stored'))
