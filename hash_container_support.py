@@ -56,19 +56,15 @@ def __lldb_init_module(debugger, dict):
 	libcxx_overrides = register_category(debugger, "lldb-toybox.libcxx-overrides")
 
 	# LLDB already includes support for these, make them easy to disable just to be safe
-	register_container_synthetic(libcxx_overrides, LibCXXUnorderedMapSynthetic)
-	register_container_synthetic(libcxx_overrides, LibCXXUnorderedSetSynthetic)
+	register_container_synthetic(libcxx_overrides, LibCXXHashContainerSynthetic)
 
 	libcxx = register_category(debugger, "lldb-toybox.libcxx")
 	abseil = register_category(debugger, "lldb-toybox.abseil")
 
 	register_container_synthetic(libcxx, LibCXXHashContainerNodeSyntheticProvider)
 
-	register_container_synthetic(abseil, AbseilFlatHashMapSynthetic)
-	register_container_synthetic(abseil, AbseilFlatHashSetSynthetic)
-	register_container_synthetic(abseil, AbseilNodeHashMapSynthetic)
-	register_container_synthetic(abseil, AbseilNodeHashSetSynthetic)
-
+	register_container_synthetic(abseil, AbseilHashContainerSynthetic)
+	register_container_synthetic(abseil, AbseilHashContainerIteratorSyntheticProvider)
 	register_container_synthetic(abseil, AbseilHashContainerConstIteratorSyntheticProvider)
 	register_container_synthetic(abseil, AbseilHashContainerNodeSyntheticProvider)
 
@@ -398,9 +394,15 @@ class PagingSyntheticAdapter(SyntheticAdapter):
 
 
 class LibCXXHashContainer(IterableContainer):
-	def __init__(self, valobj, is_map):
+	def __init__(self, valobj):
 		self.valobj = valobj
-		self.is_map = is_map
+
+		# This provider serves both unordered_set/map, as they are both backed by the same
+		#  hash table implementation, determine which variant we are
+		typename = self.valobj.GetType().GetCanonicalType().GetName()
+		match = re.search(r"^std::[^:]+::unordered_(map|set)", typename)
+
+		self.is_map = match.group(1) == 'map'
 
 	def update(self):
 		# https://github.com/apple/llvm-project/blob/next/libcxx/include/__hash_table
@@ -446,34 +448,30 @@ class LibCXXHashContainer(IterableContainer):
 				#  a little too verbose, reduce to K
 				yield remove_typedef(value)
 
-class LibCXXUnorderedMapSynthetic(SyntheticAdapter):
-	typename_regex = "^std::[^:]+::unordered_map<.+> >$"
+class LibCXXHashContainerSynthetic(SyntheticAdapter):
+	typename_regex = "^std::[^:]+::unordered_(map|set)<.+> >$"
 
 	def __init__(self, valobj, dict):
-		container = LibCXXHashContainer(valobj, True)
+		container = LibCXXHashContainer(valobj)
 
 		synthetic = IterableContainerSynthetic(container, False)
-		synthetic = SortingSyntheticAdapter(synthetic, True)
-
-		super().__init__(synthetic)
-
-class LibCXXUnorderedSetSynthetic(SyntheticAdapter):
-	typename_regex = "^std::[^:]+::unordered_set<.+> >$"
-
-	def __init__(self, valobj, dict):
-		container = LibCXXHashContainer(valobj, False)
-
-		synthetic = IterableContainerSynthetic(container, False)
-		synthetic = SortingSyntheticAdapter(synthetic, False)
+		synthetic = SortingSyntheticAdapter(synthetic, container.is_map)
 
 		super().__init__(synthetic)
 
 
 class AbseilHashContainer(IterableContainer):
-	def __init__(self, valobj, is_map, is_flat):
+	def __init__(self, valobj):
 		self.valobj = valobj
-		self.is_map = is_map
-		self.is_flat = is_flat
+
+		# Many flat_hash_... types are implemented with inheritance from raw_hash_set, and
+		#  only differ in policy template parameters. As such much of the code can be shared
+		#  between them. Determine which type we represent
+		typename = self.valobj.GetType().GetCanonicalType().GetName()
+		match = re.search(r"absl::[^:]+::(flat|node)_hash_(map|set)", typename)
+
+		self.is_flat = match.group(1) == 'flat'
+		self.is_map = match.group(2) == 'map'
 
 		# The underlying hashtable stores elements in "slots", whose type is difficult to obtain.. at the time of
 		#  writing, SB API does not let us get the typedefs in the policy template argument that would make this
@@ -550,47 +548,14 @@ class AbseilHashContainer(IterableContainer):
 				yield slot.Dereference()
 
 
-class AbseilFlatHashMapSynthetic(SyntheticAdapter):
-	typename_regex = "^absl::[^:]+::flat_hash_map<.+> >$"
+class AbseilHashContainerSynthetic(SyntheticAdapter):
+	typename_regex = "^absl::[^:]+::(flat|node)_hash_(set|map)<.+> >$"
 
 	def __init__(self, valobj, dict):
-		container = AbseilHashContainer(valobj, True, True)
+		container = AbseilHashContainer(valobj)
 
 		synthetic = IterableContainerSynthetic(container, False)
-		synthetic = SortingSyntheticAdapter(synthetic, True)
-
-		super().__init__(synthetic)
-
-class AbseilNodeHashMapSynthetic(SyntheticAdapter):
-	typename_regex = "^absl::[^:]+::node_hash_map<.+> >$"
-
-	def __init__(self, valobj, dict):
-		container = AbseilHashContainer(valobj, True, False)
-
-		synthetic = IterableContainerSynthetic(container, False)
-		synthetic = SortingSyntheticAdapter(synthetic, True)
-
-		super().__init__(synthetic)
-
-class AbseilFlatHashSetSynthetic(SyntheticAdapter):
-	typename_regex = "^absl::[^:]+::flat_hash_set<.+> >$"
-
-	def __init__(self, valobj, dict):
-		container = AbseilHashContainer(valobj, False, True)
-
-		synthetic = IterableContainerSynthetic(container, False)
-		synthetic = SortingSyntheticAdapter(synthetic, False)
-
-		super().__init__(synthetic)
-
-class AbseilNodeHashSetSynthetic(SyntheticAdapter):
-	typename_regex = "^absl::[^:]+::node_hash_set<.+> >$"
-
-	def __init__(self, valobj, dict):
-		container = AbseilHashContainer(valobj, False, True)
-
-		synthetic = IterableContainerSynthetic(container, False)
-		synthetic = SortingSyntheticAdapter(synthetic, False)
+		synthetic = SortingSyntheticAdapter(synthetic, container.is_map)
 
 		super().__init__(synthetic)
 
