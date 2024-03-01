@@ -57,11 +57,13 @@ def __lldb_init_module(debugger, dict):
 
 	# LLDB already includes support for these, make them easy to disable just to be safe
 	register_container_synthetic(libcxx_overrides, LibCXXHashContainerSynthetic)
+	register_container_synthetic(libcxx_overrides, LibCXXHashContainerIteratorSynthetic)
 
 	libcxx = register_category(debugger, "lldb-toybox.libcxx")
-	abseil = register_category(debugger, "lldb-toybox.abseil")
 
 	register_container_synthetic(libcxx, LibCXXHashContainerNodeSynthetic)
+
+	abseil = register_category(debugger, "lldb-toybox.abseil")
 
 	register_container_synthetic(abseil, AbseilHashContainerSynthetic)
 	register_container_synthetic(abseil, AbseilHashContainerIteratorSynthetic)
@@ -524,6 +526,37 @@ class LibCXXHashContainer(IterableContainer):
 				#  a little too verbose, reduce to K
 				yield remove_typedef(value)
 
+class LibCXXHashContainerIterator(Value):
+	def __init__(self, valobj):
+		self.valobj = valobj
+
+		# This provider serves both unordered_set/map, as they are both backed by the same
+		#  hash table implementation, determine which variant we are
+		typename = self.valobj.GetType().GetName()
+		match = re.search(r"^std::[^:]+::unordered_(map|set)", typename)
+
+		self.is_map = match.group(1) == 'map'
+
+		# Map iterators are hash iterators in disguise, rebind
+		if self.is_map:
+			self.valobj = valobj.GetChildMemberWithName('__i_')
+
+		# Determine node pointer type stored by this handle
+		self.node_ptr_t = self.valobj.GetType().GetTemplateArgumentType(0)
+
+	def get(self):
+		node_ptr = self.valobj.GetChildMemberWithName('__node_')
+
+		if node_ptr.GetValueAsUnsigned(0) == 0:
+			return None
+
+		node = node_ptr.Cast(self.node_ptr_t).Dereference()
+
+		if self.is_map:
+			return remove_typedef(node.GetChildMemberWithName('__value_').GetChildMemberWithName('__cc_'))
+		else:
+			return remove_typedef(node.GetChildMemberWithName('__value_'))
+
 class LibCXXHashContainerNode(Value):
 	def __init__(self, valobj):
 		self.valobj = valobj
@@ -562,6 +595,12 @@ class LibCXXHashContainerSynthetic(SyntheticAdapter):
 		synthetic = SortingSyntheticAdapter(synthetic, container.is_map)
 
 		super().__init__(synthetic)
+
+class LibCXXHashContainerIteratorSynthetic(SyntheticAdapter):
+	typename_regex = "^std::[^:]+::unordered_(set|map)<.+> >::(const_)?iterator$"
+
+	def __init__(self, valobj, dict):
+		super().__init__(ValueSynthetic(LibCXXHashContainerIterator(valobj), rename_to='pointee'))
 
 class LibCXXHashContainerNodeSynthetic(SyntheticAdapter):
 	typename_regex = "^std::[^:]+::unordered_(set|map)<.+> >::node_type$"
