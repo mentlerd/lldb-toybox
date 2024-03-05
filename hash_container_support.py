@@ -664,7 +664,7 @@ class AbseilHashContainer(IterableContainer):
 		capacity = self.get_capacity()
 
 		if not is_prime(capacity):
-			return f"Capacity {capacity} is nto pow2"
+			return f"Capacity {capacity} is not pow2"
 
 		size = self.get_size()
 
