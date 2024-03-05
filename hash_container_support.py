@@ -614,14 +614,14 @@ class LibCXXHashContainerSynthetic(SyntheticAdapter):
 		super().__init__(synthetic)
 
 class LibCXXHashContainerIteratorSynthetic(SyntheticAdapter):
-	sane_typename_regex = "^std::[^:]+::unordered_(multi?)(set|map)<.+> >::(const_)?iterator$"
+	sane_typename_regex = "^std::[^:]+::unordered_(multi)?(set|map)<.+> >::(const_)?iterator$"
 	canon_typename_regex = "^std::[^:]+::(__hash_map_iterator<std::[^:]+::__hash_iterator|__hash_const_iterator)<std::[^:]+::__hash_node<"
 
 	def __init__(self, valobj, dict):
 		super().__init__(ValueSynthetic(LibCXXHashContainerIterator(valobj), rename_to='pointee'))
 
 class LibCXXHashContainerNodeSynthetic(SyntheticAdapter):
-	sane_typename_regex = "^std::[^:]+::unordered_(multi?)(set|map)<.+> >::node_type$"
+	sane_typename_regex = "^std::[^:]+::unordered_(multi)?(set|map)<.+> >::node_type$"
 	canon_typename_regex = "^std::[^:]+::__basic_node_handle<std::[^:]+::__hash_node<"
 
 	def __init__(self, valobj, dict):
