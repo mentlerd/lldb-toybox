@@ -35,7 +35,7 @@ def register_category(debugger, name):
 	return category
 
 def register_container_synthetic(category, clazz):
-	name_spec = lldb.SBTypeNameSpecifier(clazz.typename_regex, True)
+	name_spec = lldb.SBTypeNameSpecifier(clazz.canon_typename_regex or clazz.sane_typename_regex, True)
 
 	options = lldb.eTypeOptionNone
 	options |= lldb.eTypeOptionCascade
@@ -74,6 +74,25 @@ def make_array_from_pointer(valobj, size, raw_pointer_type=None):
 	array_pointer_t = raw_pointer_type.GetPointeeType().GetArrayType(size).GetPointerType()
 
 	return valobj.Cast(array_pointer_t).Dereference()
+
+def canonize_synthetic_valobj(valobj):
+	"""
+		Synthetics seem to receive all sorts of weird values despite the options
+		 set on the registered SBTypeSynthetic object. This is possibly an Xcode
+		 integration quirk, rather than a fault of the LLDB infra.
+
+		This function can be used to strip away a bunch of unneeded wrappers from
+		 the received valobj, including pointers, references, and unnecessary 
+		 typedefs
+	"""
+	target_type = valobj.GetType()
+
+	if target_type.IsPointerType() or target_type.IsReferenceType():
+		valobj = valobj.Dereference().GetNonSyntheticValue()
+
+	target_type = valobj.GetType().GetCanonicalType().GetUnqualifiedType()
+
+	return valobj.Cast(target_type)
 
 def remove_typedef(valobj, levels=1):
 	target_type = valobj.GetType()
@@ -473,11 +492,11 @@ class PagingSyntheticAdapter(SyntheticAdapter):
 
 class LibCXXHashContainer(IterableContainer):
 	def __init__(self, valobj):
-		self.valobj = valobj
+		self.valobj = canonize_synthetic_valobj(valobj)
 
 		# This provider serves both unordered_set/map, as they are both backed by the same
 		#  hash table implementation, determine which variant we are
-		typename = self.valobj.GetType().GetCanonicalType().GetName()
+		typename = self.valobj.GetType().GetCanonicalType().GetUnqualifiedType().GetName()
 		match = re.search(r"^std::[^:]+::unordered_(?:multi)?(map|set)", typename)
 
 		self.is_map = match.group(1) == 'map'
@@ -528,14 +547,11 @@ class LibCXXHashContainer(IterableContainer):
 
 class LibCXXHashContainerIterator(Value):
 	def __init__(self, valobj):
-		self.valobj = valobj
+		self.valobj = canonize_synthetic_valobj(valobj)
 
 		# This provider serves both unordered_set/map, as they are both backed by the same
 		#  hash table implementation, determine which variant we are
-		typename = self.valobj.GetType().GetName()
-		match = re.search(r"^std::[^:]+::unordered_(?:multi)?(map|set)", typename)
-
-		self.is_map = match.group(1) == 'map'
+		self.is_map = re.search(r"std::[^:]+::__hash_const_iterator<", self.valobj.GetType().GetName()) is None
 
 		# Map iterators are hash iterators in disguise, rebind
 		if self.is_map:
@@ -559,14 +575,14 @@ class LibCXXHashContainerIterator(Value):
 
 class LibCXXHashContainerNode(Value):
 	def __init__(self, valobj):
-		self.valobj = valobj
+		self.valobj = canonize_synthetic_valobj(valobj)
 
 		# Determine node pointer type stored by this handle
 		self.node_ptr_t = self.valobj.GetType().GetTemplateArgumentType(0).GetPointerType()
 
 		# This provider serves both unordered_set/map, as they are both backed by the same
 		#  hash table implementation, determine which variant we are
-		typename = self.valobj.GetType().GetCanonicalType().GetName()
+		typename = self.valobj.GetType().GetCanonicalType().GetUnqualifiedType().GetName()
 		match = re.search("::__(set|map)_node_handle_specifics>$", typename)
 
 		self.is_map = match.group(1) == 'map'
@@ -586,7 +602,8 @@ class LibCXXHashContainerNode(Value):
 
 
 class LibCXXHashContainerSynthetic(SyntheticAdapter):
-	typename_regex = "^std::[^:]+::unordered_(multi)?(map|set)<.+> >$"
+	sane_typename_regex = "^std::[^:]+::unordered_(multi)?(map|set)<.+> >$"
+	canon_typename_regex = None
 
 	def __init__(self, valobj, dict):
 		container = LibCXXHashContainer(valobj)
@@ -597,13 +614,15 @@ class LibCXXHashContainerSynthetic(SyntheticAdapter):
 		super().__init__(synthetic)
 
 class LibCXXHashContainerIteratorSynthetic(SyntheticAdapter):
-	typename_regex = "^std::[^:]+::unordered_(multi?)(set|map)<.+> >::(const_)?iterator$"
+	sane_typename_regex = "^std::[^:]+::unordered_(multi?)(set|map)<.+> >::(const_)?iterator$"
+	canon_typename_regex = "^std::[^:]+::(__hash_map_iterator<std::[^:]+::__hash_iterator|__hash_const_iterator)<std::[^:]+::__hash_node<"
 
 	def __init__(self, valobj, dict):
 		super().__init__(ValueSynthetic(LibCXXHashContainerIterator(valobj), rename_to='pointee'))
 
 class LibCXXHashContainerNodeSynthetic(SyntheticAdapter):
-	typename_regex = "^std::[^:]+::unordered_(multi?)(set|map)<.+> >::node_type$"
+	sane_typename_regex = "^std::[^:]+::unordered_(multi?)(set|map)<.+> >::node_type$"
+	canon_typename_regex = "^std::[^:]+::__basic_node_handle<std::[^:]+::__hash_node<"
 
 	def __init__(self, valobj, dict):
 		super().__init__(ValueSynthetic(LibCXXHashContainerNode(valobj), rename_to='stored'))
@@ -611,12 +630,12 @@ class LibCXXHashContainerNodeSynthetic(SyntheticAdapter):
 
 class AbseilHashContainer(IterableContainer):
 	def __init__(self, valobj):
-		self.valobj = valobj
+		self.valobj = canonize_synthetic_valobj(valobj)
 
 		# Many flat_hash_... types are implemented with inheritance from raw_hash_set, and
 		#  only differ in policy template parameters. As such much of the code can be shared
 		#  between them. Determine which type we represent
-		typename = self.valobj.GetType().GetCanonicalType().GetName()
+		typename = self.valobj.GetType().GetCanonicalType().GetUnqualifiedType().GetName()
 		match = re.search(r"absl::[^:]+::(flat|node)_hash_(map|set)", typename)
 
 		self.is_flat = match.group(1) == 'flat'
@@ -698,9 +717,9 @@ class AbseilHashContainer(IterableContainer):
 
 class AbseilHashContainerIteratorValue(Value):
 	def __init__(self, valobj):
-		self.valobj = valobj
+		self.valobj = canonize_synthetic_valobj(valobj)
 
-		typename = self.valobj.GetType().GetCanonicalType().GetName()
+		typename = self.valobj.GetType().GetCanonicalType().GetUnqualifiedType().GetName()
 
 		# This value adapts both to const and normal iterators, rebind to the
 		#  inner value immediately in case we are a const iterator
@@ -729,7 +748,7 @@ class AbseilHashContainerIteratorValue(Value):
 
 class AbseilHashContainerNodeValue(Value):
 	def __init__(self, valobj):
-		self.valobj = valobj
+		self.valobj = canonize_synthetic_valobj(valobj)
 
 		# The same investigative work is required to obtain the policy's `slot_type`
 		self.slot_ptr_t = None
@@ -744,7 +763,7 @@ class AbseilHashContainerNodeValue(Value):
 				break
 
 		# Determining the container type is possible from the policy of the containing class
-		typename = node_handle_base.GetCanonicalType().GetName()
+		typename = node_handle_base.GetCanonicalType().GetUnqualifiedType().GetName()
 		match = re.search(r"::(Node|Flat)Hash(Map|Set)Policy<", typename)
 
 		self.is_flat = match.group(1) == 'Flat'
@@ -771,7 +790,8 @@ class AbseilHashContainerNodeValue(Value):
 
 
 class AbseilHashContainerSynthetic(SyntheticAdapter):
-	typename_regex = "^absl::[^:]+::(flat|node)_hash_(set|map)<.+> >$"
+	sane_typename_regex = "^absl::[^:]+::(flat|node)_hash_(set|map)<.+> >$"
+	canon_typename_regex = None
 
 	def __init__(self, valobj, dict):
 		container = AbseilHashContainer(valobj)
@@ -782,13 +802,15 @@ class AbseilHashContainerSynthetic(SyntheticAdapter):
 		super().__init__(synthetic)
 
 class AbseilHashContainerIteratorSynthetic(SyntheticAdapter):
-	typename_regex = "^absl::[^:]+::container_internal::raw_hash_set<.+> >::(const_)?iterator$"
+	sane_typename_regex = "^absl::[^:]+::container_internal::raw_hash_set<.+> >::(const_)?iterator$"
+	canon_typename_regex = None
 
 	def __init__(self, valobj, dict):
 		super().__init__(ValueSynthetic(AbseilHashContainerIteratorValue(valobj), rename_to='pointee'))
 
 class AbseilHashContainerNodeSynthetic(SyntheticAdapter):
-	typename_regex = "^absl::[^:]+::container_internal::raw_hash_set<.+> >::node_type$"
+	sane_typename_regex = "^absl::[^:]+::container_internal::raw_hash_set<.+> >::node_type$"
+	canon_typename_regex = "^absl::[^:]+::container_internal::node_handle<absl::[^:]+::container_internal::(Flat|Node)Hash(Map|Set)Policy"
 
 	def __init__(self, valobj, dict):
 		super().__init__(ValueSynthetic(AbseilHashContainerNodeValue(valobj), rename_to='stored'))
