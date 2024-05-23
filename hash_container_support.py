@@ -682,7 +682,7 @@ class AbseilHashContainer(IterableContainer):
 	def validate(self):
 		capacity = self.get_capacity()
 
-		if not is_prime(capacity):
+		if not is_pow2(capacity):
 			return f"Capacity {capacity} is not pow2"
 
 		size = self.get_size()
