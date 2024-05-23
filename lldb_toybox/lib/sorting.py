@@ -1,5 +1,6 @@
 
 from lldb_toybox.lib.adapter import SyntheticAdapter
+from lldb_toybox.lib.utils import *
 
 import lldb
 
