@@ -1,6 +1,8 @@
 
 import lldb
 
+import re
+
 _synthetics = list()
 
 def Synthetic(clazz):
@@ -9,7 +11,6 @@ def Synthetic(clazz):
 
 def deploy_synthetic(category, clazz):
 	class_name = f"{clazz.__module__}.{clazz.__qualname__}"
-	print(f"{class_name}")
 
 	for synth in category.get_synthetics_array():
 		if class_name in str(synth):
@@ -32,6 +33,8 @@ def deploy_synthetic(category, clazz):
 		category.AddTypeSummary(recognizer, summary)
 
 def deploy(debugger):
+
+	# Register synthetics we know about
 	for clazz in _synthetics:
 		category_name = f'lldb-toybox.{clazz.category}'
 		category = debugger.GetCategory(category_name)
@@ -42,3 +45,41 @@ def deploy(debugger):
 			category.SetEnabled(True)
 
 		deploy_synthetic(category, clazz)
+
+	# Register a stop hook for deferred initialization of things that depend on the target
+	result = lldb.SBCommandReturnObject()
+	debugger.GetCommandInterpreter().HandleCommand(f'target stop-hook add -P {__name__}.LateInitStopHook', result)
+
+	if not result.Succeeded():
+		print(f"lldb-toybox failed to install late-initialization stop hook: {result.GetError()}")
+
+class LateInitStopHook:
+	def __init__(self, target, extra_args, dict):
+		pass
+
+	def disable(self, exe_ctx):
+		debugger = exe_ctx.GetTarget().GetDebugger()
+
+		result = lldb.SBCommandReturnObject()
+		interpreter = debugger.GetCommandInterpreter()
+		interpreter.HandleCommand('target stop-hook list', result)
+
+		if not result.Succeeded():
+			raise RuntimException()
+
+		match = re.match(f'Hook: (\\d).*?Class:{__name__}.LateInitStopHook', result.GetOutput(), re.DOTALL)
+
+		if not match:
+			raise RuntimException()
+
+		debugger.HandleCommand(f'target stop-hook disable {match.group(1)}')
+
+	def handle_stop(self, exe_ctx, stream):
+		print("lldb-toybox is performing late-initialization, hold tight...", end=" ")
+
+		# First time initialization should be done once
+		self.disable(exe_ctx)
+
+		# Scan target for interesting types we might have synthetics for
+		
+		

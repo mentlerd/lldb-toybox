@@ -6,8 +6,6 @@
 import lldb
 
 def __lldb_init_module(debugger, dict):
-	print("Initializing module")
-
 	import lldb_toybox.lib.registry
 
 	import lldb_toybox.libcxx
