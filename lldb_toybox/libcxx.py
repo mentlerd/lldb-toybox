@@ -58,6 +58,10 @@ class LibCXXHashContainer(IterableContainer):
 			next = node.GetChildMemberWithName("__next_")
 			value = node.GetChildMemberWithName("__value_")
 
+			# Xcode 16 bug/quirk? __value_ is parsed as an union despite not being one?
+			if not value.IsValid():
+				value = node.GetChildAtIndex(2).GetChildMemberWithName("__value_")
+
 			if self.is_map:
 				yield value.GetChildMemberWithName("__cc_")
 			else:
