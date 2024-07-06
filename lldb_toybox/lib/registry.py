@@ -32,10 +32,6 @@ def Synthetic(clazz):
 	_synthetics.append(clazz)
 	return clazz
 
-def Initializer(func):
-	_initializers.append(func)
-	return func
-
 
 def deploy(debugger):
 	deploy_main_command(debugger)
@@ -50,8 +46,6 @@ def deploy(debugger):
 			category.SetEnabled(True)
 
 		deploy_synthetic(category, clazz)
-
-	deploy_init_hook(debugger)
 
 
 def deploy_main_command(debugger):
@@ -93,41 +87,3 @@ def deploy_synthetic(category, clazz):
 	for recognizer in clazz.recognizers:
 		category.AddTypeSynthetic(recognizer, synthetic)
 		category.AddTypeSummary(recognizer, summary)
-
-
-def deploy_init_hook(debugger):
-	result = lldb.SBCommandReturnObject()
-	debugger.GetCommandInterpreter().HandleCommand(f'target stop-hook add -P {__name__}.LateInitStopHook', result)
-
-	if not result.Succeeded():
-		print(f"lldb-toybox failed to install late-initialization stop hook: {result.GetError()}")
-
-class LateInitStopHook:
-	def __init__(self, target, extra_args, dict):
-		pass
-
-	def disable(self, debugger):
-		result = lldb.SBCommandReturnObject()
-		interpreter = debugger.GetCommandInterpreter()
-		interpreter.HandleCommand('target stop-hook list', result)
-
-		if not result.Succeeded():
-			raise RuntimException()
-
-		match = re.match(f'Hook: (\\d).*?Class:{__name__}.LateInitStopHook', result.GetOutput(), re.DOTALL)
-
-		if not match:
-			raise RuntimException()
-
-		debugger.HandleCommand(f'target stop-hook disable {match.group(1)}')
-
-	def handle_stop(self, exe_ctx, stream):
-		print("lldb-toybox is performing late-initialization, hold tight...")
-		debugger = exe_ctx.GetTarget().GetDebugger()
-
-		# Ensure we won't run again for this target
-		self.disable(debugger)
-
-		# Run initialization routines
-		for func in _initializers:
-			func(debugger, exe_ctx.GetTarget())
